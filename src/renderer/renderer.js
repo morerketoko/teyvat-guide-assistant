@@ -6,6 +6,7 @@ let currentView = 'homeView';
 // DOM元素
 const homeBtn = document.getElementById('homeBtn');
 const toggleBrowserBtn = document.getElementById('toggleBrowserBtn');
+const pinModeBtn = document.getElementById('pinModeBtn');
 const settingsBtn = document.getElementById('settingsBtn');
 const aboutBtn = document.getElementById('aboutBtn');
 const urlInput = document.getElementById('urlInput');
@@ -54,12 +55,18 @@ const defaultShortcuts = {
 
 let shortcuts = { ...defaultShortcuts };
 let listeningForShortcut = false;
+let isPinned = false;
 let currentShortcutButton = null;
 
 // 初始化函数
 function init() {
   // 设置事件监听器
   setupEventListeners();
+  // 双向同步: 主进程通知贴片状态变化
+  window.electron.receive('pinned-mode-changed', (pinned) => {
+    isPinned = !!pinned;
+    updatePinModeBtn();
+  });
   
   // 更新快捷键显示
   updateShortcutButtons();
@@ -74,6 +81,13 @@ function setupEventListeners() {
   // 浏览器控制按钮
   toggleBrowserBtn.addEventListener('click', () => {
     window.electron.send('toggle-browser');
+  });
+
+  // 贴片/HUD 模式切换
+  pinModeBtn.addEventListener('click', () => {
+    isPinned = !isPinned;
+    updatePinModeBtn();
+    window.electron.send('toggle-pinned-mode', isPinned);
   });
   
   // URL跳转
@@ -356,6 +370,12 @@ function checkShortcutConflict(shortcut, actionToIgnore) {
 }
 
 // 重置所有快捷键到默认值
+// 更新贴片按钮状态
+function updatePinModeBtn() {
+  pinModeBtn.textContent = isPinned ? '取消贴片 (交互模式)' : '\u{1F4CC} 贴片/HUD';
+  pinModeBtn.classList.toggle('active', isPinned);
+}
+
 function resetShortcuts() {
   shortcuts = { ...defaultShortcuts };
   updateShortcutButtons();

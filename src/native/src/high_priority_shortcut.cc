@@ -22,6 +22,11 @@ std::map<std::pair<UINT, UINT>, std::string> keyboardHookMap; // (modifiers, vkC
 HHOOK mouseHook = NULL;
 HHOOK keyboardHook = NULL;
 
+    // FIX: dedicated pump-thread globals for the low-level hooks
+    std::thread hookMessageThread;
+    DWORD hookMessageThreadId = 0;
+    bool hookMessageLoopRunning = false;
+
 // Track modifier key states
 bool isShiftPressed = false;
 bool isCtrlPressed = false;
@@ -133,6 +138,15 @@ LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
 
 // Stop hotkey listener
 void StopHotkeyListener() {
+    // FIX: signal the hook pump thread to quit first (WM_QUIT wakes GetMessage)
+    if (hookMessageLoopRunning) {
+        if (hookMessageThreadId != 0) {
+            PostThreadMessage(hookMessageThreadId, WM_QUIT, 0, 0);
+        }
+        hookMessageLoopRunning = false;
+        OutputDebugStringA("[Teyvat Debug] StopHotkeyListener: pump thread signaled to quit");
+    }
+
     // Stop keyboard hook - THE ULTIMATE STOPPER!
     if (keyboardHook) {
         UnhookWindowsHookEx(keyboardHook);
@@ -345,24 +359,50 @@ Napi::Value Start(const Napi::CallbackInfo& info) {
         }
     }
 
-    // Install THE ULTIMATE KEYBOARD HOOK - Works in fullscreen games!
-    if (!keyboardHookMap.empty()) {
-        keyboardHook = SetWindowsHookEx(WH_KEYBOARD_LL, KeyboardHookProc, GetModuleHandle(NULL), 0);
-        if (keyboardHook) {
-            keyboardHookRunning = true;
-        }
+    // FIX: install the low-level hooks inside a dedicated thread that runs a
+    // Win32 message pump. WH_KEYBOARD_LL / WH_MOUSE_LL callbacks are only
+    // delivered while the owning thread pumps messages; without the pump the
+    // hooks are silently dead under fullscreen / borderless games.
+    if (!keyboardHookMap.empty() || !mouseKeyMap.empty()) {
+        hookMessageLoopRunning = true;
+        hookMessageThread = std::thread([]() {
+            hookMessageThreadId = GetCurrentThreadId();
+
+            if (!keyboardHookMap.empty()) {
+                keyboardHook = SetWindowsHookExW(WH_KEYBOARD_LL, KeyboardHookProc, GetModuleHandle(NULL), 0);
+                keyboardHookRunning = (keyboardHook != NULL);
+                OutputDebugStringA(keyboardHookRunning
+                    ? "[Teyvat Debug] WH_KEYBOARD_LL installed on pump thread"
+                    : "[Teyvat Debug] WH_KEYBOARD_LL install FAILED");
+            }
+            if (!mouseKeyMap.empty()) {
+                mouseHook = SetWindowsHookExW(WH_MOUSE_LL, MouseHookProc, GetModuleHandle(NULL), 0);
+                mouseHookRunning = (mouseHook != NULL);
+                OutputDebugStringA(mouseHookRunning
+                    ? "[Teyvat Debug] WH_MOUSE_LL installed on pump thread"
+                    : "[Teyvat Debug] WH_MOUSE_LL install FAILED");
+            }
+
+            // REQUIRED message pump for low-level hooks
+            MSG msg = {0};
+            while (hookMessageLoopRunning && GetMessage(&msg, NULL, 0, 0) > 0) {
+                TranslateMessage(&msg);
+                DispatchMessage(&msg);
+            }
+
+            // Cleanup on loop exit
+            if (keyboardHook) { UnhookWindowsHookEx(keyboardHook); keyboardHook = NULL; keyboardHookRunning = false; }
+            if (mouseHook) { UnhookWindowsHookEx(mouseHook); mouseHook = NULL; mouseHookRunning = false; }
+            hookMessageLoopRunning = false;
+            hookMessageThreadId = 0;
+        });
+        hookMessageThread.detach();
     }
 
-    // Install mouse hook (if there are mouse shortcuts)
-    if (!mouseKeyMap.empty()) {
-        mouseHook = SetWindowsHookEx(WH_MOUSE_LL, MouseHookProc, GetModuleHandle(NULL), 0);
-        if (mouseHook) {
-            mouseHookRunning = true;
-        }
-    }
-
-    // Keep legacy RegisterHotKey as backup (in case hooks fail in some scenarios)
-    if (!hotkeysToRegister.empty() && !keyboardHookRunning) {
+    // FIX: always start the RegisterHotKey backup thread. The old condition
+    // (!keyboardHookRunning) short-circuited it whenever the LL hook install
+    // "succeeded" - even when the hook was dead for lack of a message pump.
+    if (!hotkeysToRegister.empty()) {
         isRunning = true;
         hotkeyThread = std::thread([hotkeysToRegister]() {
             hotkeyThreadId = GetCurrentThreadId();
@@ -370,9 +410,18 @@ Napi::Value Start(const Napi::CallbackInfo& info) {
             
             // Register hotkeys
             for (const auto& hotkey : hotkeysToRegister) {
+                // RegisterHotKey REQUIRES at least one modifier; bare keys like
+                // Insert (modifiers == 0) always fail here - the LL hook covers them.
+                if (hotkey.modifiers == 0) {
+                    OutputDebugStringA(("[Teyvat Debug] RegisterHotKey skip bare key: " + hotkey.actionName).c_str());
+                    continue;
+                }
                 int id = nextHotkeyId++;
                 if (RegisterHotKey(NULL, id, hotkey.modifiers, hotkey.vkCode)) {
                     idToActionMap[id] = hotkey.actionName;
+                    OutputDebugStringA(("[Teyvat Debug] RegisterHotKey OK: " + hotkey.actionName).c_str());
+                } else {
+                    OutputDebugStringA(("[Teyvat Debug] RegisterHotKey FAILED: " + hotkey.actionName).c_str());
                 }
             }
 

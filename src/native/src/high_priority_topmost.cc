@@ -1,239 +1,267 @@
 #include <napi.h>
 #include <windows.h>
-#include <map>
-#include <string>
 #include <thread>
+#include <atomic>
+#include <functional>
 #include <chrono>
+#include <string>
+#include <vector>
 
-// Global state for window management
-std::map<std::string, HWND> trackedWindows;
-bool monitoringActive = false;
+// ============================================================
+// High-priority topmost module - HWND-direct, Z-order precise
+//
+// FIX vs old implementation:
+//   - No more title-string lookup (brittle: case-sensitive match,
+//     dynamic web-page titles, hidden windows being skipped).
+//   - Window handle is passed directly as a Napi Buffer (from
+//     Electron's getNativeWindowHandle()) / BigInt / Number.
+//   - Dual-mode: interactive mode (default) keeps WS_EX_NOACTIVATE
+//     cleared so the window can take focus when summoned; pinned
+//     (HUD) mode dynamically attaches WS_EX_NOACTIVATE via
+//     setWindowPinnedMode so the window stays topmost-pinned but
+//     never steals focus from the game.
+//   - Monitor thread uses a precise GW_HWNDPREV check instead of
+//     the fuzzy "walk top N windows" heuristic, and re-asserts
+//     TOPMOST without activating (SWP_NOACTIVATE) on a 200ms
+//     cadence so it wins the Z-order race against fullscreen games.
+// ============================================================
+
+// Global state
+std::atomic<bool> monitoringActive{false};
 std::thread monitorThread;
+HWND trackedHwnd = NULL;
 
-// Enhanced window enumeration callback for finding target windows
-BOOL CALLBACK EnumWindowsProc(HWND hwnd, LPARAM lParam) {
-    DWORD processId;
-    GetWindowThreadProcessId(hwnd, &processId);
-    
-    // Try both ANSI and Unicode window text
-    char windowTextA[512];
-    wchar_t windowTextW[512];
-    GetWindowTextA(hwnd, windowTextA, sizeof(windowTextA));
-    GetWindowTextW(hwnd, windowTextW, sizeof(windowTextW)/sizeof(wchar_t));
-    
-    char className[256];
-    GetClassNameA(hwnd, className, sizeof(className));
-    
-    // Check if window is visible and has a title
-    if (IsWindowVisible(hwnd) && (strlen(windowTextA) > 0 || wcslen(windowTextW) > 0)) {
-        std::string* targetTitle = reinterpret_cast<std::string*>(lParam);
-        std::string currentTitleA(windowTextA);
-        
-        // Convert Unicode to UTF-8 for comparison
-        std::string currentTitleW;
-        if (wcslen(windowTextW) > 0) {
-            int utf8Length = WideCharToMultiByte(CP_UTF8, 0, windowTextW, -1, NULL, 0, NULL, NULL);
-            if (utf8Length > 0) {
-                std::vector<char> utf8Buffer(utf8Length);
-                WideCharToMultiByte(CP_UTF8, 0, windowTextW, -1, utf8Buffer.data(), utf8Length, NULL, NULL);
-                currentTitleW = std::string(utf8Buffer.data());
-            }
+// Extract an HWND from a Napi argument (Buffer / BigInt / Number)
+HWND GetHWNDFromArg(const Napi::CallbackInfo& info, size_t index) {
+    if (info.Length() <= index) return NULL;
+
+    if (info[index].IsBuffer()) {
+        Napi::Buffer<char> buf = info[index].As<Napi::Buffer<char>>();
+        if (buf.Length() >= sizeof(HWND)) {
+            return *reinterpret_cast<HWND*>(buf.Data());
         }
-        
-        // Case-insensitive search for window title (try both ANSI and UTF-8)
-        bool foundA = currentTitleA.find(*targetTitle) != std::string::npos;
-        bool foundW = !currentTitleW.empty() && currentTitleW.find(*targetTitle) != std::string::npos;
-        
-        if (foundA || foundW) {
-            trackedWindows[*targetTitle] = hwnd;
-            return FALSE; // Stop enumeration when found
-        }
+        return NULL;
     }
-    
-    return TRUE; // Continue enumeration
+    if (info[index].IsBigInt()) {
+        bool lossless = false;
+        int64_t v = info[index].As<Napi::BigInt>().Int64Value(&lossless);
+        return reinterpret_cast<HWND>(static_cast<uintptr_t>(v));
+    }
+    if (info[index].IsNumber()) {
+        return reinterpret_cast<HWND>(
+            static_cast<uintptr_t>(info[index].As<Napi::Number>().Int64Value()));
+    }
+    return NULL;
 }
 
-// Function to find window by title (partial match)
-HWND FindWindowByTitle(const std::string& titleSubstring) {
-    trackedWindows.clear();
-    EnumWindows(EnumWindowsProc, reinterpret_cast<LPARAM>(&titleSubstring));
-    
-    auto it = trackedWindows.find(titleSubstring);
-    return (it != trackedWindows.end()) ? it->second : NULL;
-}
-
-// Advanced window topmost setting with UIAccess-like behavior
+// Set / clear topmost; never leaves WS_EX_NOACTIVATE set
 bool SetWindowAlwaysOnTop(HWND hwnd, bool topmost) {
-    if (!IsWindow(hwnd)) {
-        return false;
-    }
-    
+    if (!IsWindow(hwnd)) return false;
+
     HWND insertAfter = topmost ? HWND_TOPMOST : HWND_NOTOPMOST;
     UINT flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE;
-    
-    // First attempt: Standard topmost setting
-    bool result = SetWindowPos(hwnd, insertAfter, 0, 0, 0, 0, flags);
-    
-    if (topmost && result) {
-        // Enhanced approach: Force window to stay on top
-        // This mimics UIAccess behavior for better fullscreen game compatibility
-        
-        // Get current window style
+
+    if (topmost) {
+        // FIX: clear WS_EX_NOACTIVATE - it blocked activation, which is why
+        // summoned windows could not take focus in front of games.
         LONG_PTR exStyle = GetWindowLongPtr(hwnd, GWL_EXSTYLE);
-        
-        // Add WS_EX_TOPMOST and WS_EX_NOACTIVATE for better compatibility
-        exStyle |= WS_EX_TOPMOST | WS_EX_NOACTIVATE;
-        SetWindowLongPtr(hwnd, GWL_EXSTYLE, exStyle);
-        
-        // Force update with multiple attempts for stubborn fullscreen applications
+        if (exStyle & WS_EX_NOACTIVATE) {
+            SetWindowLongPtr(hwnd, GWL_EXSTYLE, exStyle & ~WS_EX_NOACTIVATE);
+        }
+    }
+
+    bool result = SetWindowPos(hwnd, insertAfter, 0, 0, 0, 0, flags);
+
+    // Re-assert topmost a few times for stubborn fullscreen apps
+    if (topmost && result) {
         for (int i = 0; i < 3; i++) {
             SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, flags);
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
-        
-        // Additional technique: Set window to system-level priority
-        // This helps when dealing with fullscreen games that try to override topmost
-        SetWindowPos(hwnd, reinterpret_cast<HWND>(-1), 0, 0, 0, 0, flags);
     }
-    
     return result;
 }
 
-// Monitor thread function to maintain topmost status against fullscreen applications
-void MonitorWindowTopmost(HWND targetWindow) {
-    while (monitoringActive && IsWindow(targetWindow)) {
-        // Check if window is still topmost
-        HWND topWindow = GetTopWindow(GetDesktopWindow());
-        bool isOnTop = false;
-        
-        // Walk through top-level windows to check if our window is among the topmost
-        HWND currentWindow = topWindow;
-        for (int i = 0; i < 10 && currentWindow; i++) { // Check top 10 windows
-            if (currentWindow == targetWindow) {
-                isOnTop = true;
-                break;
-            }
-            currentWindow = GetNextWindow(currentWindow, GW_HWNDNEXT);
+// Burst-summon: force foreground + topmost, breaking the Windows foreground
+// lock that fullscreen / borderless games rely on.
+bool ForceForegroundAndTopmost(HWND hwnd) {
+    if (!hwnd || !IsWindow(hwnd)) return false;
+
+    // 1. Ensure the window can take focus
+    LONG_PTR exStyle = GetWindowLongPtr(hwnd, GWL_EXSTYLE);
+    if (exStyle & WS_EX_NOACTIVATE) {
+        SetWindowLongPtr(hwnd, GWL_EXSTYLE, exStyle & ~WS_EX_NOACTIVATE);
+    }
+
+    // 2. AttachThreadInput - documented workaround for the foreground lock
+    HWND foregroundWindow = GetForegroundWindow();
+    DWORD currentThreadId = GetCurrentThreadId();
+    DWORD foregroundThreadId = 0;
+    bool attached = false;
+    if (foregroundWindow && foregroundWindow != hwnd) {
+        foregroundThreadId = GetWindowThreadProcessId(foregroundWindow, NULL);
+        if (currentThreadId != 0 && foregroundThreadId != 0) {
+            AttachThreadInput(currentThreadId, foregroundThreadId, TRUE);
+            attached = true;
         }
-        
-        // If not on top, force it back to top
-        if (!isOnTop) {
-            SetWindowAlwaysOnTop(targetWindow, true);
+    }
+
+    // 3. Show, elevate to TOPMOST, bring to top, grab foreground + focus
+    ShowWindow(hwnd, SW_SHOW);
+    SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+    BringWindowToTop(hwnd);
+    SetForegroundWindow(hwnd);
+    SetFocus(hwnd);
+    SetActiveWindow(hwnd);
+
+    if (attached) {
+        AttachThreadInput(currentThreadId, foregroundThreadId, FALSE);
+    }
+
+    bool grabbed = (GetForegroundWindow() == hwnd);
+    OutputDebugStringA(grabbed
+        ? "[Teyvat Debug] forceForegroundAndTopmost: OK"
+        : "[Teyvat Debug] forceForegroundAndTopmost: forward not confirmed");
+    return grabbed;
+}
+
+// Monitor thread: precise Z-order check. If ANY window sits above the target,
+// re-assert TOPMOST without activating (SWP_NOACTIVATE), so the window stays
+// on top without stealing focus from the game mid-play.
+void MonitorThreadLoop(HWND targetHwnd, std::atomic<bool>& running) {
+    while (running.load()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        if (!IsWindow(targetHwnd) || !IsWindowVisible(targetHwnd)) {
+            continue;
         }
-        
-        // Sleep to prevent excessive CPU usage
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        // GW_HWNDPREV = window directly above in the Z-order; NULL means we
+        // are already at the very top.
+        if (GetWindow(targetHwnd, GW_HWNDPREV) != NULL) {
+            SetWindowPos(targetHwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOSENDCHANGING);
+        }
     }
 }
 
-// Start monitoring a window to keep it always on top
+// Start monitoring a window by direct HWND
 Napi::Value StartWindowMonitoring(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    
-    if (info.Length() < 1 || !info[0].IsString()) {
-        Napi::TypeError::New(env, "Window title string required").ThrowAsJavaScriptException();
-        return env.Null();
-    }
-    
-    std::string windowTitle = info[0].As<Napi::String>().Utf8Value();
-    
-    // Find the target window
-    HWND targetWindow = FindWindowByTitle(windowTitle);
+    HWND targetWindow = GetHWNDFromArg(info, 0);
     if (!targetWindow) {
-        Napi::Error::New(env, "Window not found: " + windowTitle).ThrowAsJavaScriptException();
+        Napi::TypeError::New(env, "Valid HWND required (Buffer / BigInt / Number)")
+            .ThrowAsJavaScriptException();
         return env.Null();
     }
-    
-    // Set window to always on top
-    bool success = SetWindowAlwaysOnTop(targetWindow, true);
-    
-    if (success) {
-        // Stop any existing monitoring
-        monitoringActive = false;
-        if (monitorThread.joinable()) {
-            monitorThread.join();
-        }
-        
-        // Start new monitoring thread
-        monitoringActive = true;
-        monitorThread = std::thread(MonitorWindowTopmost, targetWindow);
-        monitorThread.detach();
-        
-        return Napi::Boolean::New(env, true);
-    }
-    
-    return Napi::Boolean::New(env, false);
-}
 
-// Stop monitoring and remove topmost status
-Napi::Value StopWindowMonitoring(const Napi::CallbackInfo& info) {
-    Napi::Env env = info.Env();
-    
-    monitoringActive = false;
-    
+    // Stop any previous monitoring (detached thread exits within ~200ms)
+    monitoringActive.exchange(false);
     if (monitorThread.joinable()) {
         monitorThread.join();
     }
-    
-    // Optional: Remove topmost from all tracked windows
-    if (info.Length() > 0 && info[0].IsString()) {
-        std::string windowTitle = info[0].As<Napi::String>().Utf8Value();
-        HWND targetWindow = FindWindowByTitle(windowTitle);
-        if (targetWindow) {
-            SetWindowAlwaysOnTop(targetWindow, false);
-        }
-    }
-    
+
+    // Elevate immediately and grab the front once
+    SetWindowAlwaysOnTop(targetWindow, true);
+    ForceForegroundAndTopmost(targetWindow);
+
+    trackedHwnd = targetWindow;
+    monitoringActive = true;
+    monitorThread = std::thread(MonitorThreadLoop, targetWindow, std::ref(monitoringActive));
+    monitorThread.detach();
+
+    OutputDebugStringA("[Teyvat Debug] startWindowMonitoring(HWND): monitor thread started");
     return Napi::Boolean::New(env, true);
 }
 
-// Set specific window topmost without monitoring
+// Stop monitoring
+Napi::Value StopWindowMonitoring(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    monitoringActive.exchange(false);
+    if (monitorThread.joinable()) {
+        monitorThread.join();
+    }
+    trackedHwnd = NULL;
+    return Napi::Boolean::New(env, true);
+}
+
+// Set a window topmost (HWND version)
 Napi::Value SetWindowTopmost(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
-    
-    if (info.Length() < 2 || !info[0].IsString() || !info[1].IsBoolean()) {
-        Napi::TypeError::New(env, "Window title string and boolean topmost flag required").ThrowAsJavaScriptException();
-        return env.Null();
-    }
-    
-    std::string windowTitle = info[0].As<Napi::String>().Utf8Value();
-    bool topmost = info[1].As<Napi::Boolean>().Value();
-    
-    HWND targetWindow = FindWindowByTitle(windowTitle);
+    HWND targetWindow = GetHWNDFromArg(info, 0);
     if (!targetWindow) {
         return Napi::Boolean::New(env, false);
     }
-    
-    bool success = SetWindowAlwaysOnTop(targetWindow, topmost);
-    return Napi::Boolean::New(env, success);
+    bool topmost = (info.Length() > 1 && info[1].IsBoolean())
+        ? info[1].As<Napi::Boolean>().Value() : true;
+    return Napi::Boolean::New(env, SetWindowAlwaysOnTop(targetWindow, topmost));
 }
 
-// Get list of all visible windows (for debugging)
+// Export wrapper for the burst summon
+Napi::Value ForceForegroundAndTopmostExport(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    HWND targetWindow = GetHWNDFromArg(info, 0);
+    if (!targetWindow) {
+        return Napi::Boolean::New(env, false);
+    }
+    return Napi::Boolean::New(env, ForceForegroundAndTopmost(targetWindow));
+}
+
+// Dual-mode support: toggle WS_EX_NOACTIVATE on the target window.
+//   - isPinned = true  -> HUD/pinned mode: attach WS_EX_NOACTIVATE so the
+//     window keeps showing (topmost-pinned) but cannot steal focus from the
+//     game, which keeps running in the background.
+//   - isPinned = false -> interactive mode: detach WS_EX_NOACTIVATE so the
+//     window can be activated and focused again (typing / searching).
+Napi::Value SetWindowPinnedMode(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (info.Length() < 2) {
+        return Napi::Boolean::New(env, false);
+    }
+
+    HWND targetWindow = GetHWNDFromArg(info, 0);
+    if (!targetWindow || !::IsWindow(targetWindow)) {
+        return Napi::Boolean::New(env, false);
+    }
+
+    bool isPinned = info[1].As<Napi::Boolean>().Value();
+
+    LONG_PTR exStyle = ::GetWindowLongPtr(targetWindow, GWL_EXSTYLE);
+    if (isPinned) {
+        exStyle |= WS_EX_NOACTIVATE;
+    } else {
+        exStyle &= ~static_cast<LONG_PTR>(WS_EX_NOACTIVATE);
+    }
+    ::SetWindowLongPtr(targetWindow, GWL_EXSTYLE, exStyle);
+
+    // Force the style change through: refresh frame, keep current Z-order
+    // and activation state untouched.
+    ::SetWindowPos(targetWindow, NULL, 0, 0, 0, 0,
+                   SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED | SWP_NOACTIVATE);
+
+    return Napi::Boolean::New(env, true);
+}
+
+// Get list of all visible windows (debugging)
 Napi::Value GetVisibleWindows(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     Napi::Array windowList = Napi::Array::New(env);
-    
+
     struct EnumData {
         Napi::Env env;
         Napi::Array* array;
         uint32_t index;
     };
-    
     EnumData enumData = { env, &windowList, 0 };
-    
+
     EnumWindows([](HWND hwnd, LPARAM lParam) -> BOOL {
         EnumData* data = reinterpret_cast<EnumData*>(lParam);
-        
         if (IsWindowVisible(hwnd)) {
-            // Try both ANSI and Unicode
             char windowTextA[512];
             wchar_t windowTextW[512];
             GetWindowTextA(hwnd, windowTextA, sizeof(windowTextA));
             GetWindowTextW(hwnd, windowTextW, sizeof(windowTextW)/sizeof(wchar_t));
-            
+
             std::string title;
-            
-            // Prefer Unicode title with UTF-8 conversion
             if (wcslen(windowTextW) > 0) {
                 int utf8Length = WideCharToMultiByte(CP_UTF8, 0, windowTextW, -1, NULL, 0, NULL, NULL);
                 if (utf8Length > 0) {
@@ -244,62 +272,19 @@ Napi::Value GetVisibleWindows(const Napi::CallbackInfo& info) {
             } else if (strlen(windowTextA) > 0) {
                 title = std::string(windowTextA);
             }
-            
+
             if (!title.empty()) {
                 Napi::Object windowInfo = Napi::Object::New(data->env);
                 windowInfo.Set("title", Napi::String::New(data->env, title));
-                windowInfo.Set("handle", Napi::Number::New(data->env, reinterpret_cast<uintptr_t>(hwnd)));
-                
+                windowInfo.Set("handle", Napi::Number::New(data->env,
+                    reinterpret_cast<uintptr_t>(hwnd)));
                 data->array->Set(data->index++, windowInfo);
             }
         }
-        
         return TRUE;
     }, reinterpret_cast<LPARAM>(&enumData));
-    
-    return windowList;
-}
 
-// Force window to foreground (additional utility function)
-Napi::Value BringWindowToForeground(const Napi::CallbackInfo& info) {
-    Napi::Env env = info.Env();
-    
-    if (info.Length() < 1 || !info[0].IsString()) {
-        Napi::TypeError::New(env, "Window title string required").ThrowAsJavaScriptException();
-        return env.Null();
-    }
-    
-    std::string windowTitle = info[0].As<Napi::String>().Utf8Value();
-    HWND targetWindow = FindWindowByTitle(windowTitle);
-    
-    if (!targetWindow) {
-        return Napi::Boolean::New(env, false);
-    }
-    
-    // Multiple techniques to bring window to foreground
-    bool success = false;
-    
-    // Method 1: Standard approach
-    if (SetForegroundWindow(targetWindow)) {
-        success = true;
-    }
-    
-    // Method 2: Alternative approach for stubborn windows
-    if (!success) {
-        DWORD currentThreadId = GetCurrentThreadId();
-        DWORD targetThreadId = GetWindowThreadProcessId(targetWindow, NULL);
-        
-        AttachThreadInput(currentThreadId, targetThreadId, TRUE);
-        SetForegroundWindow(targetWindow);
-        AttachThreadInput(currentThreadId, targetThreadId, FALSE);
-        success = true;
-    }
-    
-    // Method 3: Force show and activate
-    ShowWindow(targetWindow, SW_SHOW);
-    SetActiveWindow(targetWindow);
-    
-    return Napi::Boolean::New(env, success);
+    return windowList;
 }
 
 // Module initialization
@@ -308,8 +293,8 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
     exports.Set("stopWindowMonitoring", Napi::Function::New(env, StopWindowMonitoring));
     exports.Set("setWindowTopmost", Napi::Function::New(env, SetWindowTopmost));
     exports.Set("getVisibleWindows", Napi::Function::New(env, GetVisibleWindows));
-    exports.Set("bringWindowToForeground", Napi::Function::New(env, BringWindowToForeground));
-    
+    exports.Set("forceForegroundAndTopmost", Napi::Function::New(env, ForceForegroundAndTopmostExport));
+    exports.Set("setWindowPinnedMode", Napi::Function::New(env, SetWindowPinnedMode));
     return exports;
 }
 

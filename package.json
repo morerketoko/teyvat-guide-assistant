@@ -67,7 +67,8 @@
           ]
         }
       ],
-      "icon": "src/renderer/assets/logo.png"
+      "icon": "src/renderer/assets/logo.png",
+      "requestedExecutionLevel": "requireAdministrator"
     },
     "forceCodeSigning": false,
     "nsis": {

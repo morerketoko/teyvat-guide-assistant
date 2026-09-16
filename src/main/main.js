@@ -397,16 +397,17 @@ function createBrowserWindow(url) {
     }
     
     // 启用高级置顶功能（如果可用，延迟启动）
+    // Start the advanced topmost monitor (HWND-direct, shorter delay)
     if (highPriorityTopmost && highPriorityTopmost.isAvailable()) {
       setTimeout(() => {
-        console.log('Starting advanced topmost monitoring');
+        console.log("[Teyvat Debug] starting browser window monitoring");
         try {
-          const result = startAdvancedTopmost();
-          console.log('Advanced topmost result:', result);
+          const result = startBrowserWindowMonitoring();
+          console.log("[Teyvat Debug] startBrowserWindowMonitoring ->", result);
         } catch (err) {
-          console.error('Advanced topmost error:', err);
+          console.error("[Teyvat Debug] startBrowserWindowMonitoring error:", err);
         }
-      }, 2000);
+      }, 1000);
     }
   });
   
@@ -462,22 +463,89 @@ function createBrowserWindow(url) {
 
 }
 
+// FIX: summon = burst. Fullscreen games re-activate / re-topmost themselves
+// every frame, so a single topmost call gets pushed back. Fire
+// forceForegroundAndTopmost at 0/50/150ms plus a focus retry at 200ms to win
+// the Z-order / foreground race. The window handle is now passed directly as
+// the native HWND (getNativeWindowHandle) - the brittle title-string lookup
+// is gone.
+function summonBrowserWindow() {
+  if (!browserWindow || browserWindow.isDestroyed()) {
+    console.log("[Teyvat Debug] summonBrowserWindow: window gone, recreating");
+    createBrowserWindow();
+    return;
+  }
+
+  console.log("[Teyvat Debug] summonBrowserWindow: burst start");
+
+  if (browserWindow.isMinimized()) {
+    browserWindow.restore();
+  }
+  browserWindow.show();
+  browserWindow.setAlwaysOnTop(true, "screen-saver");
+
+  // Grab the native HWND (Buffer) and pass it straight to the C++ module
+  let hwndBuffer = null;
+  try {
+    hwndBuffer = browserWindow.getNativeWindowHandle();
+  } catch (err) {
+    console.error("[Teyvat Debug] summonBrowserWindow: getNativeWindowHandle error:", err);
+  }
+
+  const burstGrab = () => {
+    if (!hwndBuffer || !highPriorityTopmost || !highPriorityTopmost.isAvailable()) {
+      return;
+    }
+    try {
+      highPriorityTopmost.forceForegroundAndTopmost(hwndBuffer);
+    } catch (err) {
+      console.error("[Teyvat Debug] summonBrowserWindow: forceForegroundAndTopmost error:", err);
+    }
+  };
+
+  // Burst grabs at 0 / 50 / 150 ms + a final focus retry at 200 ms
+  burstGrab();
+  setTimeout(burstGrab, 50);
+  setTimeout(burstGrab, 150);
+  setTimeout(() => {
+    try {
+      browserWindow.focus();
+    } catch (err) {
+      console.error("[Teyvat Debug] summonBrowserWindow: focus error:", err);
+    }
+    console.log("[Teyvat Debug] summonBrowserWindow: burst done");
+  }, 200);
+
+  if (mainWindow) {
+    mainWindow.webContents.send("browser-window-created");
+  }
+  console.log("[Teyvat Debug] summonBrowserWindow: shown, burst scheduled");
+}
 function toggleBrowserVisibility() {
-  if (browserWindow) {
-    if (browserWindow.isVisible()) {
+  console.log('[Teyvat Debug] toggleBrowserVisibility triggered');
+
+  if (!browserWindow || browserWindow.isDestroyed()) {
+    console.log('[Teyvat Debug] no browser window, creating...');
+    createBrowserWindow();
+    return;
+  }
+
+  if (browserWindow.isVisible() && !browserWindow.isMinimized()) {
+    if (browserWindow.isFocused()) {
+      // 已在前台 → 隐藏
       browserWindow.hide();
+      console.log('[Teyvat Debug] window hidden');
       if (mainWindow) {
         mainWindow.webContents.send('browser-window-closed');
       }
     } else {
-      browserWindow.show();
-      if (mainWindow) {
-        mainWindow.webContents.send('browser-window-created');
-      }
+      // 可见但无焦点（被全屏游戏遮挡）→ 强制呼出到最前
+      console.log('[Teyvat Debug] visible but not focused (game overlay) - forcing to front');
+      summonBrowserWindow();
     }
-
   } else {
-    createBrowserWindow(); // 调用时不带URL，使用默认值
+    // 不可见或已最小化 → 呼出并抢前台
+    summonBrowserWindow();
   }
 }
 
@@ -515,59 +583,28 @@ function adjustBrowserOpacity(delta) {
   }
 }
 
-// 启动高级置顶功能（带重试机制）
-function startAdvancedTopmost(retryCount = 3) {
+// Start the advanced topmost monitor using the DIRECT native HWND.
+// A monitor thread keeps the window at the top of the Z-order (precise
+// GW_HWNDPREV check, 200ms, no activation) so it stays above the game.
+function startBrowserWindowMonitoring() {
   if (!browserWindow || !highPriorityTopmost || !highPriorityTopmost.isAvailable()) {
+    console.log("[Teyvat Debug] startBrowserWindowMonitoring: unavailable");
     return false;
   }
-  
-  // 获取所有可见窗口用于调试
+
   try {
-    const allWindows = highPriorityTopmost.getVisibleWindows();
-    console.log('Available windows:', allWindows.map(w => w.title).slice(0, 5)); // 只显示前5个
-    
-    // 尝试多种窗口标题匹配策略
-    const actualTitle = browserWindow.getTitle();
-    console.log('Current browser window title:', actualTitle);
-    
-    const titleVariants = [
-      actualTitle,             // 当前网页的实际标题
-      '提瓦特浏览器',           // 原始中文标题
-      'Teyvat Browser',        // 英文标题
-      'Teyvat'                // 部分匹配
-    ];
-    
-    let success = false;
-    for (const title of titleVariants) {
-      if (title && title.trim()) {
-        try {
-          console.log(`Trying to monitor window with title: "${title}"`);
-          success = highPriorityTopmost.startMonitoring(title);
-          if (success) {
-            console.log(`Advanced topmost monitoring started successfully with title: "${title}"`);
-            break;
-          }
-        } catch (err) {
-          console.log(`Failed to monitor "${title}":`, err.message);
-        }
-      }
+    const hwndBuffer = browserWindow.getNativeWindowHandle();
+    const ok = highPriorityTopmost.startMonitoring(hwndBuffer);
+    console.log("[Teyvat Debug] startMonitoring(hwnd) ->", ok);
+
+    // Fallback: keep basic topmost if the native monitor is unavailable
+    if (!ok) {
+      browserWindow.setAlwaysOnTop(true, "screen-saver");
     }
-    
-    if (success) {
-      return true;
-    } else if (retryCount > 0) {
-      console.log(`Retrying advanced topmost in 2 seconds... (${retryCount} attempts left)`);
-      setTimeout(() => startAdvancedTopmost(retryCount - 1), 2000);
-      return false;
-    } else {
-      console.log('All advanced topmost attempts failed, using basic topmost');
-      browserWindow.setAlwaysOnTop(true, 'screen-saver', 1);
-      return false;
-    }
+    return ok;
   } catch (err) {
-    console.error('Error in startAdvancedTopmost:', err);
-    // 确保基本置顶功能
-    browserWindow.setAlwaysOnTop(true, 'screen-saver', 1);
+    console.error("[Teyvat Debug] startBrowserWindowMonitoring error:", err);
+    browserWindow.setAlwaysOnTop(true, "screen-saver");
     return false;
   }
 }
@@ -605,7 +642,7 @@ function toggleAdvancedTopmost(enable = null) {
     // 尝试高级置顶（如果可用）
     if (highPriorityTopmost && highPriorityTopmost.isAvailable()) {
       try {
-        const result = startAdvancedTopmost();
+        const result = startBrowserWindowMonitoring();
         console.log('Advanced topmost result:', result);
       } catch (err) {
         console.error('Error with advanced topmost:', err);
@@ -632,6 +669,43 @@ ipcMain.on('update-shortcuts', (_, newShortcuts) => {
 });
 
 ipcMain.on('toggle-browser', toggleBrowserVisibility);
+
+// 双模式切换: 贴片/HUD 与交互/强焦点
+ipcMain.on('toggle-pinned-mode', (event, isPinned) => {
+  if (!browserWindow || browserWindow.isDestroyed()) {
+    console.log('[Teyvat Debug] toggle-pinned-mode: no browser window');
+    return;
+  }
+  const hwndBuffer = browserWindow.getNativeWindowHandle();
+  let ok = false;
+  if (highPriorityTopmost && highPriorityTopmost.isAvailable()) {
+    try {
+      ok = highPriorityTopmost.setPinnedMode(hwndBuffer, isPinned);
+      console.log('[Teyvat Debug] setPinnedMode ->', ok, 'pinned =', isPinned);
+    } catch (err) {
+      console.error('[Teyvat Debug] setPinnedMode error:', err);
+    }
+  }
+  if (isPinned) {
+    // 贴片模式: 退还焦点给游戏
+    browserWindow.blur();
+    console.log('[Teyvat Debug] pinned ON, focus back to game');
+  } else {
+    // 交互模式: 强夺前台并聚焦
+    try {
+      highPriorityTopmost.forceForegroundAndTopmost(hwndBuffer);
+      browserWindow.focus();
+    } catch (err) {
+      console.error('[Teyvat Debug] re-activate error:', err);
+    }
+    console.log('[Teyvat Debug] pinned OFF, interactive restored');
+  }
+  // 通知渲染进程同步按钮状态
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('pinned-mode-changed', isPinned);
+  }
+});
+
 
 ipcMain.on('navigate-browser', (event, url) => {
   if (browserWindow) {
