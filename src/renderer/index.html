@@ -57,6 +57,10 @@
           <span class="key">Insert</span>
           <span class="action">显示/隐藏</span>
         </div>
+        <div class="shortcut-item">
+          <span class="key">Ctrl+Shift+L</span>
+          <span class="action">鼠标锁定</span>
+        </div>
       </div>
     </div>
     
@@ -72,6 +76,7 @@
           <div class="home-controls">
             <button id="toggleBrowserBtn" class="control-btn large">打开浏览器</button>
             <button id="pinModeBtn" class="control-btn large">📌 贴片/HUD</button>
+            <button id="mouseLockBtn" class="control-btn large mouse-lock" title="锁定后鼠标操作将穿透攻略窗口">🔓 鼠标锁定</button>
           </div>
           <div class="url-input-container">
             <input type="text" id="urlInput" class="url-input" placeholder="输入网址后按回车或点跳转">
@@ -140,6 +145,10 @@
           <div class="shortcut-setting-item">
             <span class="shortcut-label">减少透明度:</span>
             <button class="shortcut-button" data-action="decreaseOpacity">Control+Down</button>
+          </div>
+          <div class="shortcut-setting-item">
+            <span class="shortcut-label">鼠标锁定（鼠标穿透攻略窗口）:</span>
+            <button class="shortcut-button" data-action="toggleMouseLock">Control+Shift+L</button>
           </div>
         </div>
         

@@ -475,6 +475,18 @@ input:checked + .slider:before {
   background-color: #2980b9;
 }
 
+/* 鼠标锁定按钮：仅作用于 .mouse-lock，不影响其它 control-btn 的既有样式 */
+.control-btn.large.mouse-lock.active {
+  background-color: var(--accent-color);
+  border-color: var(--accent-color);
+  color: var(--dark-color);
+  box-shadow: 0 0 8px rgba(212, 175, 55, 0.7);
+}
+
+.control-btn.large.mouse-lock.active:hover {
+  background-color: #c9a431;
+}
+
 /* URL输入区域样式 */
 .url-input-container {
   display: flex;

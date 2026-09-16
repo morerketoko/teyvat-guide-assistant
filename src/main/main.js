@@ -55,20 +55,24 @@ function debounce(func, wait) {
   };
 }
 
+// 默认快捷键（唯一来源：主进程 store 默认值与 C++ 注册共用，避免多处硬编码）
+const DEFAULT_SHORTCUTS = {
+  toggleBrowser: 'Insert',
+  playPause: 'F1',
+  rewind: 'F2',
+  forward: 'F3',
+  increaseOpacity: 'Control+Up',
+  decreaseOpacity: 'Control+Down',
+  toggleMouseLock: 'Control+Shift+L'
+};
+
 // 配置存储
 const store = new Store({
   defaults: {
     mainWindowBounds: { width: 800, height: 600 },
     browserWindowBounds: { width: 400, height: 720, x: 50, y: 50 },
     lastUrl: 'https://www.bilibili.com',
-    shortcuts: {
-      toggleBrowser: 'Insert',
-      playPause: 'F1',
-      rewind: 'F2',
-      forward: 'F3',
-      increaseOpacity: 'Control+Up',
-      decreaseOpacity: 'Control+Down',
-    },
+    shortcuts: { ...DEFAULT_SHORTCUTS },
     browserOpacity: 0.8,
     enableGpuAcceleration: false,
     bookmarks: [],
@@ -82,10 +86,25 @@ const store = new Store({
 let mainWindow = null;
 let browserWindow = null;
 
+// 浏览器窗口「鼠标锁定」状态。
+//   false = 浏览器正常接收鼠标输入
+//   true  = 浏览器完全忽略鼠标输入，鼠标事件穿透到下层窗口/游戏（全局快捷键不受影响）
+// 注意：与 Pinned/HUD 模式是两个独立概念。
+//   Pinned Mode  = WS_EX_NOACTIVATE，控制「激活/焦点」行为（native）
+//   Mouse Lock   = setIgnoreMouseEvents，控制「鼠标输入是否穿透」（Electron）
+// 两者互不依赖，四种组合（HUD±, Lock±）都必须成立。
+// 该状态刻意不写入 store：启动时始终为 false，但浏览器窗口重建时沿用内存中的当前值。
+let browserMouseLocked = false;
+
 // 快捷键处理函数
 function handleShortcut(action) {
   console.log('Shortcut triggered:', action);
-  
+
+  // 通知渲染进程高亮对应的快捷键提示（主窗口 UI 反馈）
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('shortcut-triggered', action);
+  }
+
   switch (action) {
     case 'toggleBrowser':
       toggleBrowserVisibility();
@@ -101,9 +120,78 @@ function handleShortcut(action) {
     case 'decreaseOpacity':
       adjustBrowserOpacity(-0.1);
       break;
+    case 'toggleMouseLock':
+      toggleBrowserMouseLock();
+      break;
     default:
       console.log('Unknown shortcut action:', action);
   }
+}
+
+// ===== 鼠标锁定 (Mouse Lock) =====
+// 唯一的窗口级落地函数：只调 setIgnoreMouseEvents，不碰窗口样式/置顶/位置/大小。
+function applyBrowserMouseLockToWindow() {
+  if (!browserWindow || browserWindow.isDestroyed()) {
+    return false;
+  }
+  try {
+    browserWindow.setIgnoreMouseEvents(browserMouseLocked);
+    return true;
+  } catch (err) {
+    console.error('[Teyvat Debug] failed to set browser mouse lock:', err);
+    return false;
+  }
+}
+
+// 统一状态入口：所有锁定状态变化（快捷键 / IPC / 未来其它来源）都必须走这里，
+// 禁止在多个 IPC、快捷键分支里散调 setIgnoreMouseEvents。
+function setBrowserMouseLock(locked) {
+  const next = !!locked;
+  const changed = browserMouseLocked !== next;
+  browserMouseLocked = next;
+
+  if (changed) {
+    console.log(next ? '[Teyvat Debug] browser mouse lock enabled' : '[Teyvat Debug] browser mouse lock disabled');
+  }
+
+  const applied = applyBrowserMouseLockToWindow();
+
+  if (changed) {
+    // 锁定时若浏览器正持有焦点，主动让出焦点（复用现有的 blur 机制），
+    // 避免锁定后键盘输入仍被攻略窗口吃掉。不改变置顶状态、不调 forceForegroundAndTopmost。
+    if (next && browserWindow && !browserWindow.isDestroyed()) {
+      try {
+        if (browserWindow.isFocused()) {
+          browserWindow.blur();
+        }
+      } catch (err) {
+        console.error('[Teyvat Debug] failed to release browser focus:', err);
+      }
+    }
+
+    // 同步主窗口 UI 状态
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('mouse-lock-changed', browserMouseLocked);
+    }
+  }
+
+  return applied;
+}
+
+function toggleBrowserMouseLock() {
+  return setBrowserMouseLock(!browserMouseLocked);
+}
+
+// 合并默认快捷键：老版本 store 里没有 toggleMouseLock，补齐后 C++ 模块才能注册它
+function getShortcutsWithDefaults() {
+  const stored = store.get('shortcuts') || {};
+  const merged = { ...DEFAULT_SHORTCUTS, ...stored };
+  const missing = Object.keys(DEFAULT_SHORTCUTS).filter(key => !(key in stored));
+  if (missing.length > 0) {
+    store.set('shortcuts', merged);
+    console.log('[Teyvat Debug] shortcuts config migrated, added defaults:', missing.join(', '));
+  }
+  return merged;
 }
 
 // 执行媒体操作
@@ -246,8 +334,8 @@ function initializeHighPriorityShortcuts() {
       handleShortcut(action);
     });
     
-    // 注册快捷键
-    const shortcuts = store.get('shortcuts');
+    // 注册快捷键（含新增的 toggleMouseLock，缺项自动补齐）
+    const shortcuts = getShortcutsWithDefaults();
     highPriorityShortcut.registerShortcuts(shortcuts);
     
     console.log('High-priority shortcuts initialized successfully');
@@ -260,11 +348,13 @@ function initializeHighPriorityShortcuts() {
 
 // 更新快捷键
 function updateShortcuts(newShortcuts) {
-  store.set('shortcuts', newShortcuts);
-  
+  // 与默认值合并，避免渲染进程传来的对象缺项时丢掉已有快捷键
+  const merged = { ...DEFAULT_SHORTCUTS, ...(newShortcuts || {}) };
+  store.set('shortcuts', merged);
+
   if (highPriorityShortcut) {
     try {
-      highPriorityShortcut.registerShortcuts(newShortcuts);
+      highPriorityShortcut.registerShortcuts(merged);
       console.log('Shortcuts updated successfully');
     } catch (err) {
       console.error('Failed to update shortcuts:', err);
@@ -382,6 +472,11 @@ function createBrowserWindow(url) {
     }
   });
 
+  // 建窗后立刻套用当前鼠标锁定状态：
+  // 锁定状态下关闭浏览器再呼出时，新窗口必须直接进入穿透状态（不闪一次可交互）。
+  console.log('[Teyvat Debug] applying browser mouse lock state:', browserMouseLocked);
+  applyBrowserMouseLockToWindow();
+
   browserWindow.once('ready-to-show', () => {
     browserWindow.show();
     
@@ -440,6 +535,9 @@ function createBrowserWindow(url) {
   browserWindow.on('move', debouncedSaveBounds);
 
   browserWindow.on('closed', () => {
+    // 刻意不重置 browserMouseLocked：
+    // 用户可能在游戏中关闭攻略窗口，再次呼出时仍希望保持锁定状态。
+    // 新窗口创建时会按当前值重新套用 setIgnoreMouseEvents。
     // 停止topmost监控
     if (highPriorityTopmost && highPriorityTopmost.isAvailable()) {
       try {
@@ -670,6 +768,17 @@ ipcMain.on('update-shortcuts', (_, newShortcuts) => {
 
 ipcMain.on('toggle-browser', toggleBrowserVisibility);
 
+// 鼠标锁定：渲染进程只发起「切换」请求，窗口操作统一在主进程里做
+// （renderer 不允许直接控制 BrowserWindow）
+ipcMain.on('toggle-mouse-lock', () => {
+  toggleBrowserMouseLock();
+});
+
+// 渲染进程初始化时同步一次当前锁定状态
+ipcMain.on('get-mouse-lock-status', (event) => {
+  event.reply('mouse-lock-changed', browserMouseLocked);
+});
+
 // 双模式切换: 贴片/HUD 与交互/强焦点
 ipcMain.on('toggle-pinned-mode', (event, isPinned) => {
   if (!browserWindow || browserWindow.isDestroyed()) {
@@ -730,9 +839,10 @@ ipcMain.on('adjust-opacity', (_, newOpacity) => {
 
 ipcMain.on('get-initial-settings', (event) => {
   event.reply('initial-settings', {
-    shortcuts: store.get('shortcuts'),
+    shortcuts: getShortcutsWithDefaults(),
     opacity: store.get('browserOpacity'),
-    enableGpu: store.get('enableGpuAcceleration')
+    enableGpu: store.get('enableGpuAcceleration'),
+    mouseLocked: browserMouseLocked
   });
 });
 

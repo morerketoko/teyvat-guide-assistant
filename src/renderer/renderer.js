@@ -7,6 +7,7 @@ let currentView = 'homeView';
 const homeBtn = document.getElementById('homeBtn');
 const toggleBrowserBtn = document.getElementById('toggleBrowserBtn');
 const pinModeBtn = document.getElementById('pinModeBtn');
+const mouseLockBtn = document.getElementById('mouseLockBtn');
 const settingsBtn = document.getElementById('settingsBtn');
 const aboutBtn = document.getElementById('aboutBtn');
 const urlInput = document.getElementById('urlInput');
@@ -50,12 +51,15 @@ const defaultShortcuts = {
   rewind: 'F2',
   forward: 'F3',
   increaseOpacity: 'Control+Up',
-  decreaseOpacity: 'Control+Down'
+  decreaseOpacity: 'Control+Down',
+  toggleMouseLock: 'Control+Shift+L'
 };
 
 let shortcuts = { ...defaultShortcuts };
 let listeningForShortcut = false;
 let isPinned = false;
+// 鼠标锁定状态（与 Pinned/HUD 模式相互独立，可任意组合）
+let isMouseLocked = false;
 let currentShortcutButton = null;
 
 // 初始化函数
@@ -67,9 +71,17 @@ function init() {
     isPinned = !!pinned;
     updatePinModeBtn();
   });
-  
+
+  // 双向同步: 主进程通知鼠标锁定状态变化（快捷键或按钮触发）
+  window.electron.receive('mouse-lock-changed', (locked) => {
+    isMouseLocked = !!locked;
+    updateMouseLockButton();
+  });
+
   // 更新快捷键显示
   updateShortcutButtons();
+  // 初始化按钮状态（默认未锁定）
+  updateMouseLockButton();
   
   // 初始化透明度滑块
   opacitySlider.value = 0.8;
@@ -88,6 +100,11 @@ function setupEventListeners() {
     isPinned = !isPinned;
     updatePinModeBtn();
     window.electron.send('toggle-pinned-mode', isPinned);
+  });
+
+  // 鼠标锁定切换（renderer 只发请求，状态由主进程回推）
+  mouseLockBtn.addEventListener('click', () => {
+    window.electron.send('toggle-mouse-lock');
   });
   
   // URL跳转
@@ -225,8 +242,8 @@ function setupEventListeners() {
     showView(`${view}View`);
   });
   
-  window.electron.receive('initial-settings', ({ shortcuts: loadedShortcuts, opacity, enableGpu }) => {
-    shortcuts = loadedShortcuts;
+  window.electron.receive('initial-settings', ({ shortcuts: loadedShortcuts, opacity, enableGpu, mouseLocked }) => {
+    shortcuts = { ...defaultShortcuts, ...loadedShortcuts };
     updateShortcutButtons();
     updateShortcutDisplay();
     
@@ -234,6 +251,11 @@ function setupEventListeners() {
     opacityValue.textContent = opacity.toFixed(1);
 
     gpuToggle.checked = enableGpu;
+
+    if (mouseLocked !== undefined) {
+      isMouseLocked = !!mouseLocked;
+      updateMouseLockButton();
+    }
   });
 
   window.electron.receive('bookmarks-updated', (updatedBookmarks) => {
@@ -376,6 +398,15 @@ function updatePinModeBtn() {
   pinModeBtn.classList.toggle('active', isPinned);
 }
 
+// 更新鼠标锁定按钮状态（锁定 = 鼠标穿透攻略窗口）
+function updateMouseLockButton() {
+  mouseLockBtn.textContent = isMouseLocked ? '🔒 鼠标已锁定' : '🔓 鼠标锁定';
+  mouseLockBtn.classList.toggle('active', isMouseLocked);
+  mouseLockBtn.title = isMouseLocked
+    ? '已锁定，鼠标不会操作攻略窗口；按快捷键可解锁'
+    : '锁定后鼠标操作将穿透攻略窗口';
+}
+
 function resetShortcuts() {
   shortcuts = { ...defaultShortcuts };
   updateShortcutButtons();
@@ -400,6 +431,9 @@ function updateShortcutDisplay() {
   shortcutItems[2].textContent = shortcuts.forward;
   shortcutItems[3].textContent = `${shortcuts.increaseOpacity.replace('+Up', '')}+↑/↓`;
   shortcutItems[4].textContent = shortcuts.toggleBrowser;
+  if (shortcutItems[5]) {
+    shortcutItems[5].textContent = shortcuts.toggleMouseLock;
+  }
 }
 
 // 更新浏览器按钮状态
@@ -416,12 +450,14 @@ function highlightShortcutAction(action) {
     forward: 2,
     increaseOpacity: 3,
     decreaseOpacity: 3,
-    toggleBrowser: 4
+    toggleBrowser: 4,
+    toggleMouseLock: 5
   };
   
   const index = actionMap[action];
   if (index !== undefined) {
     const item = document.querySelectorAll('.shortcut-item')[index];
+    if (!item) return;
     item.classList.add('highlight');
     setTimeout(() => {
       item.classList.remove('highlight');
@@ -433,6 +469,7 @@ function highlightShortcutAction(action) {
 document.addEventListener('DOMContentLoaded', () => {
   init();
   window.electron.send('get-initial-settings');
+  window.electron.send('get-mouse-lock-status');
   window.electron.send('get-bookmarks');
   window.electron.send('get-zoom-level');
   updateBrowserButtonState(false);
